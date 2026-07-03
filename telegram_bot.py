@@ -5,6 +5,7 @@ import logging
 import asyncio
 from pathlib import Path
 from collections import defaultdict
+from datetime import datetime
 
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 PROMPT_FILE = "system-prompt.txt"
 USER_LANG_FILE = "user_langs.json"
 ADMIN_FILE = "admin_users.json"
+SUDO_LOG_FILE = "sudo_audit.json"
 
 MODEL_CONFIG = {
     "name": os.getenv("MODEL_NAME", "deepseek/deepseek-chat"),
@@ -49,8 +51,11 @@ CONVERSATION_HISTORY: dict[int, list[dict]] = defaultdict(list)
 
 # === Admin/Sudo Configuration ===
 ADMIN_USERS: set[int] = set()
+SUDO_USERS: set[int] = set()  # ⭐ NEW: Sudo users with elevated privileges
 BLACKLIST: set[int] = set()
 WHITELIST: set[int] = set()
+SUDO_AUDIT_LOG: list[dict] = []  # ⭐ NEW: Audit log for sudo actions
+
 BOT_STATS: dict = {
     "total_messages": 0,
     "total_users": 0,
@@ -100,16 +105,17 @@ def get_user_lang(user_id: int) -> str:
 # ======================================================================
 
 def load_admin_users():
-    """Load admin users from file."""
-    global ADMIN_USERS, BLACKLIST, WHITELIST
+    """Load admin and sudo users from file."""
+    global ADMIN_USERS, SUDO_USERS, BLACKLIST, WHITELIST, SUDO_AUDIT_LOG
     if Path(ADMIN_FILE).exists():
         try:
             with open(ADMIN_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 ADMIN_USERS = set(data.get("admins", []))
+                SUDO_USERS = set(data.get("sudo_users", []))  # ⭐ Load sudo users
                 BLACKLIST = set(data.get("blacklist", []))
                 WHITELIST = set(data.get("whitelist", []))
-                logger.info(f"✅ Loaded {len(ADMIN_USERS)} admin(s)")
+                logger.info(f"✅ Loaded {len(ADMIN_USERS)} admin(s) and {len(SUDO_USERS)} sudo user(s)")
         except (json.JSONDecodeError, IOError) as e:
             logger.warning(f"Failed to load admin users: {e}")
     else:
@@ -117,15 +123,25 @@ def load_admin_users():
         owner_id = int(os.getenv("OWNER_ID", "0"))
         if owner_id > 0:
             ADMIN_USERS.add(owner_id)
+            SUDO_USERS.add(owner_id)  # ⭐ Owner is automatically sudo
             save_admin_users()
+    
+    # Load sudo audit log
+    if Path(SUDO_LOG_FILE).exists():
+        try:
+            with open(SUDO_LOG_FILE, "r", encoding="utf-8") as f:
+                SUDO_AUDIT_LOG = json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            logger.warning(f"Failed to load sudo audit log: {e}")
 
 
 def save_admin_users():
-    """Save admin users to file."""
+    """Save admin and sudo users to file."""
     try:
         with open(ADMIN_FILE, "w", encoding="utf-8") as f:
             json.dump({
                 "admins": list(ADMIN_USERS),
+                "sudo_users": list(SUDO_USERS),  # ⭐ Save sudo users
                 "blacklist": list(BLACKLIST),
                 "whitelist": list(WHITELIST),
             }, f, indent=2)
@@ -133,9 +149,32 @@ def save_admin_users():
         logger.error(f"Failed to save admin users: {e}")
 
 
+def log_sudo_action(sudo_user_id: int, action: str, target_id: int = None, details: str = ""):
+    """Log sudo actions for audit trail."""
+    log_entry = {
+        "timestamp": datetime.now().isoformat(),
+        "sudo_user": sudo_user_id,
+        "action": action,
+        "target_id": target_id,
+        "details": details,
+    }
+    SUDO_AUDIT_LOG.append(log_entry)
+    
+    try:
+        with open(SUDO_LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(SUDO_AUDIT_LOG, f, indent=2)
+    except IOError as e:
+        logger.error(f"Failed to save sudo audit log: {e}")
+
+
 def is_admin(user_id: int) -> bool:
     """Check if user is admin."""
     return user_id in ADMIN_USERS
+
+
+def is_sudo(user_id: int) -> bool:
+    """Check if user is sudo (elevated privileges)."""
+    return user_id in SUDO_USERS
 
 
 def is_blacklisted(user_id: int) -> bool:
@@ -378,6 +417,7 @@ async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     is_admin_user = is_admin(user_id)
+    is_sudo_user = is_sudo(user_id)
     
     msg = (
         "📖 <b>WormGPT Commands</b>\n"
@@ -412,6 +452,23 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  /admin users — Total users\n"
             "  /admin reset_all — Reset all conversations\n"
             "  /admin broadcast <message> — Send to all users\n"
+        )
+    
+    if is_sudo_user:
+        msg += (
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚡ <b>SUDO COMMANDS (ELEVATED)</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "🔐 <b>Sudo Management:</b>\n"
+            "  /sudo add <code>user_id</code> — Grant sudo access\n"
+            "  /sudo remove <code>user_id</code> — Revoke sudo access\n"
+            "  /sudo list — List all sudo users\n\n"
+            "📝 <b>Audit & Logs:</b>\n"
+            "  /sudo audit — View sudo action audit log\n"
+            "  /sudo purge_audit — Clear audit log\n\n"
+            "🔥 <b>System Control:</b>\n"
+            "  /sudo shutdown — Graceful bot shutdown\n"
+            "  /sudo clearall — Clear all data (CAUTION!)\n"
         )
     
     msg += (
@@ -540,6 +597,7 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📨 Total Messages: {BOT_STATS['total_messages']}\n"
             f"👥 Total Users: {len(CONVERSATION_HISTORY)}\n"
             f"🔑 Admins: {len(ADMIN_USERS)}\n"
+            f"⚡ Sudo Users: {len(SUDO_USERS)}\n"
             f"🚫 Blacklist: {len(BLACKLIST)}\n"
             f"⚪ Whitelist: {len(WHITELIST)} {'(active)' if WHITELIST else '(inactive)'}"
         )
@@ -574,6 +632,128 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await update.message.reply_text(
             f"✅ Broadcast sent to {count} users.",
+            parse_mode=ParseMode.HTML
+        )
+
+
+# ======================================================================
+# === SUDO COMMANDS (NEW - ELEVATED PRIVILEGES) =======================
+# ======================================================================
+
+async def sudo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sudo control panel - elevated privileges."""
+    user_id = update.message.from_user.id
+    
+    if not is_sudo(user_id):
+        await update.message.reply_text("❌ You don't have sudo permissions.")
+        log_sudo_action(user_id, "unauthorized_access_attempt", None, "Tried to access sudo commands")
+        return
+    
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "⚡ <b>Sudo Panel (Elevated)</b>\n\n"
+            "Usage: /sudo <command>\n"
+            "/sudo add <user_id>\n"
+            "/sudo remove <user_id>\n"
+            "/sudo list\n"
+            "/sudo audit\n"
+            "/sudo purge_audit\n"
+            "/sudo shutdown\n"
+            "/sudo clearall",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    action = args[0].lower()
+    
+    if action == "add" and len(args) > 1:
+        try:
+            target_id = int(args[1])
+            SUDO_USERS.add(target_id)
+            save_admin_users()
+            log_sudo_action(user_id, "grant_sudo", target_id, f"Granted sudo to {target_id}")
+            await update.message.reply_text(
+                f"⚡ User {target_id} now has SUDO access.",
+                parse_mode=ParseMode.HTML
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID.")
+    
+    elif action == "remove" and len(args) > 1:
+        try:
+            target_id = int(args[1])
+            SUDO_USERS.discard(target_id)
+            save_admin_users()
+            log_sudo_action(user_id, "revoke_sudo", target_id, f"Revoked sudo from {target_id}")
+            await update.message.reply_text(
+                f"⚡ User {target_id} sudo access revoked.",
+                parse_mode=ParseMode.HTML
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID.")
+    
+    elif action == "list":
+        sudo_list = ", ".join([str(id) for id in sorted(SUDO_USERS)])
+        await update.message.reply_text(
+            f"⚡ <b>Sudo Users:</b> {sudo_list}",
+            parse_mode=ParseMode.HTML
+        )
+    
+    elif action == "audit":
+        if not SUDO_AUDIT_LOG:
+            await update.message.reply_text("📝 <b>Sudo Audit Log:</b> Empty", parse_mode=ParseMode.HTML)
+            return
+        
+        log_text = "📝 <b>Sudo Audit Log (Last 10):</b>\n━━━━━━━━━━━━\n"
+        for entry in SUDO_AUDIT_LOG[-10:]:
+            log_text += (
+                f"<code>⏰ {entry['timestamp']}\n"
+                f"👤 User: {entry['sudo_user']}\n"
+                f"🔧 Action: {entry['action']}\n"
+                f"🎯 Target: {entry.get('target_id', 'N/A')}\n"
+                f"📝 Details: {entry.get('details', 'N/A')}</code>\n━━\n"
+            )
+        await update.message.reply_text(log_text, parse_mode=ParseMode.HTML)
+    
+    elif action == "purge_audit":
+        SUDO_AUDIT_LOG.clear()
+        try:
+            with open(SUDO_LOG_FILE, "w", encoding="utf-8") as f:
+                json.dump([], f)
+        except IOError as e:
+            logger.error(f"Failed to purge sudo audit log: {e}")
+        log_sudo_action(user_id, "purge_audit", None, "Cleared audit log")
+        await update.message.reply_text(
+            "🧹 <b>Sudo audit log cleared!</b>",
+            parse_mode=ParseMode.HTML
+        )
+    
+    elif action == "shutdown":
+        log_sudo_action(user_id, "shutdown", None, "Initiated bot shutdown")
+        await update.message.reply_text(
+            "🛑 <b>Bot shutting down gracefully...</b>",
+            parse_mode=ParseMode.HTML
+        )
+        logger.warning(f"🛑 Bot shutdown initiated by sudo user {user_id}")
+        import sys
+        sys.exit(0)
+    
+    elif action == "clearall":
+        # ⚠️ WARNING: This is a destructive action
+        CONVERSATION_HISTORY.clear()
+        SUDO_AUDIT_LOG.clear()
+        try:
+            with open(SUDO_LOG_FILE, "w", encoding="utf-8") as f:
+                json.dump([], f)
+        except IOError as e:
+            logger.error(f"Failed to clear data: {e}")
+        log_sudo_action(user_id, "clearall", None, "CRITICAL: Cleared all data")
+        await update.message.reply_text(
+            "⚠️ <b>ALL DATA CLEARED!</b>\n"
+            "• Conversation history cleared\n"
+            "• Audit logs cleared\n"
+            "• User sessions reset",
             parse_mode=ParseMode.HTML
         )
 
@@ -887,6 +1067,7 @@ async def post_init(application):
         BotCommand("stats", "📊 Your usage stats"),
         BotCommand("ping", "🏓 Check latency"),
         BotCommand("admin", "👑 Admin panel"),
+        BotCommand("sudo", "⚡ Sudo panel"),
         BotCommand("blacklist", "🚫 Blacklist users"),
         BotCommand("whitelist", "⚪ Whitelist users"),
     ]
@@ -925,6 +1106,7 @@ def run_bot():
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CommandHandler("sudo", sudo_cmd))
     app.add_handler(CommandHandler("blacklist", blacklist_cmd))
     app.add_handler(CommandHandler("whitelist", whitelist_cmd))
 
@@ -940,6 +1122,7 @@ def run_bot():
 
     logger.info("🚀 WormGPT Bot Running... (Model: %s)", MODEL_CONFIG["name"])
     logger.info("👑 Admin System Initialized")
+    logger.info("⚡ Sudo System Initialized")
 
     # Python 3.14+ removed auto-creation of event loops
     try:

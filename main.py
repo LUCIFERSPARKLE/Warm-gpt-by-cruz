@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # === Validate required env vars ===
-required_vars = ["8267095618:AAFKUedUQkPvz99oPY64f1H7DmWZUNMV9_E", "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"]
+required_vars = ["TELEGRAM_TOKEN", "OPENROUTER_KEY"]
 missing = [v for v in required_vars if not os.getenv(v)]
 if missing:
     print(f"❌ Missing environment variables: {', '.join(missing)}")

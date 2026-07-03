@@ -30,10 +30,10 @@ USER_LANG_FILE = "user_langs.json"
 MODEL_CONFIG = {
     "name": os.getenv("MODEL_NAME", "deepseek/deepseek-chat"),
     "base_url": os.getenv("API_BASE_URL", "https://openrouter.ai/api/v1"),
-    "key": os.getenv("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"),
+    "key": os.getenv("OPENROUTER_KEY"),
 }
 
-TELEGRAM_TOKEN = os.getenv("8267095618:AAFKUedUQkPvz99oPY64f1H7DmWZUNMV9_E")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 # === Channels required to join ===
 REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "@rex_developers")

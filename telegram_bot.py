@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 PROMPT_FILE = "system-prompt.txt"
 USER_LANG_FILE = "user_langs.json"
+ADMIN_FILE = "admin_users.json"
 
 MODEL_CONFIG = {
     "name": os.getenv("MODEL_NAME", "deepseek/deepseek-chat"),
@@ -45,6 +46,16 @@ FLOOD_DELAY = 2  # seconds
 # === Conversation History ===
 MAX_HISTORY = 20  # max messages per user (10 pairs)
 CONVERSATION_HISTORY: dict[int, list[dict]] = defaultdict(list)
+
+# === Admin/Sudo Configuration ===
+ADMIN_USERS: set[int] = set()
+BLACKLIST: set[int] = set()
+WHITELIST: set[int] = set()
+BOT_STATS: dict = {
+    "total_messages": 0,
+    "total_users": 0,
+    "start_time": time.time(),
+}
 
 
 # ======================================================================
@@ -82,6 +93,59 @@ def save_user_langs():
 
 def get_user_lang(user_id: int) -> str:
     return USER_LANGS.get(str(user_id), "en")
+
+
+# ======================================================================
+# === Admin/Sudo Management ============================================
+# ======================================================================
+
+def load_admin_users():
+    """Load admin users from file."""
+    global ADMIN_USERS, BLACKLIST, WHITELIST
+    if Path(ADMIN_FILE).exists():
+        try:
+            with open(ADMIN_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                ADMIN_USERS = set(data.get("admins", []))
+                BLACKLIST = set(data.get("blacklist", []))
+                WHITELIST = set(data.get("whitelist", []))
+                logger.info(f"✅ Loaded {len(ADMIN_USERS)} admin(s)")
+        except (json.JSONDecodeError, IOError) as e:
+            logger.warning(f"Failed to load admin users: {e}")
+    else:
+        # Create initial file with owner
+        owner_id = int(os.getenv("OWNER_ID", "0"))
+        if owner_id > 0:
+            ADMIN_USERS.add(owner_id)
+            save_admin_users()
+
+
+def save_admin_users():
+    """Save admin users to file."""
+    try:
+        with open(ADMIN_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "admins": list(ADMIN_USERS),
+                "blacklist": list(BLACKLIST),
+                "whitelist": list(WHITELIST),
+            }, f, indent=2)
+    except IOError as e:
+        logger.error(f"Failed to save admin users: {e}")
+
+
+def is_admin(user_id: int) -> bool:
+    """Check if user is admin."""
+    return user_id in ADMIN_USERS
+
+
+def is_blacklisted(user_id: int) -> bool:
+    """Check if user is blacklisted."""
+    return user_id in BLACKLIST
+
+
+def is_whitelisted(user_id: int) -> bool:
+    """Check if user is whitelisted."""
+    return len(WHITELIST) == 0 or user_id in WHITELIST
 
 
 # ======================================================================
@@ -195,6 +259,11 @@ def get_join_keyboard():
 async def force_join_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Returns True if user passed the join check, False if blocked."""
     user_id = update.effective_user.id
+    
+    # Skip force join for admins
+    if is_admin(user_id):
+        return True
+    
     is_member = await check_membership(context.bot, user_id)
 
     if not is_member:
@@ -307,6 +376,9 @@ async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ======================================================================
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    is_admin_user = is_admin(user_id)
+    
     msg = (
         "📖 <b>WormGPT Commands</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -316,12 +388,40 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📊 /stats — Your usage statistics\n"
         "🏓 /ping — Check bot latency\n"
         "📖 /help — Show this help message\n\n"
+    )
+    
+    if is_admin_user:
+        msg += (
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "👑 <b>ADMIN COMMANDS</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "🔧 <b>User Management:</b>\n"
+            "  /admin add <code>user_id</code> — Add admin\n"
+            "  /admin remove <code>user_id</code> — Remove admin\n"
+            "  /admin list — List all admins\n\n"
+            "🚫 <b>Blacklist/Whitelist:</b>\n"
+            "  /blacklist add <code>user_id</code> — Ban user\n"
+            "  /blacklist remove <code>user_id</code> — Unban user\n"
+            "  /blacklist list — View blacklist\n"
+            "  /whitelist on — Enable whitelist mode\n"
+            "  /whitelist off — Disable whitelist mode\n"
+            "  /whitelist add <code>user_id</code> — Whitelist user\n"
+            "  /whitelist remove <code>user_id</code> — Remove whitelist\n\n"
+            "📊 <b>Monitoring:</b>\n"
+            "  /admin status — Bot statistics\n"
+            "  /admin users — Total users\n"
+            "  /admin reset_all — Reset all conversations\n"
+            "  /admin broadcast <message> — Send to all users\n"
+        )
+    
+    msg += (
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "💡 <b>Tips:</b>\n"
         "• In groups, mention the bot or reply to it\n"
         "• Bot remembers your conversation context\n"
         "• Use /reset to start a fresh conversation"
     )
+    
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
@@ -371,6 +471,270 @@ async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ======================================================================
+# === ADMIN COMMANDS ===================================================
+# ======================================================================
+
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin control panel."""
+    user_id = update.message.from_user.id
+    
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ You don't have admin permissions.")
+        return
+    
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "👑 <b>Admin Panel</b>\n\n"
+            "Usage: /admin <command>\n"
+            "/admin add <user_id>\n"
+            "/admin remove <user_id>\n"
+            "/admin list\n"
+            "/admin status\n"
+            "/admin users\n"
+            "/admin reset_all\n"
+            "/admin broadcast <message>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    action = args[0].lower()
+    
+    if action == "add" and len(args) > 1:
+        try:
+            target_id = int(args[1])
+            ADMIN_USERS.add(target_id)
+            save_admin_users()
+            await update.message.reply_text(
+                f"✅ User {target_id} is now an admin.",
+                parse_mode=ParseMode.HTML
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID.")
+    
+    elif action == "remove" and len(args) > 1:
+        try:
+            target_id = int(args[1])
+            ADMIN_USERS.discard(target_id)
+            save_admin_users()
+            await update.message.reply_text(
+                f"✅ User {target_id} is no longer an admin.",
+                parse_mode=ParseMode.HTML
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID.")
+    
+    elif action == "list":
+        admins_list = ", ".join([str(id) for id in sorted(ADMIN_USERS)])
+        await update.message.reply_text(
+            f"👑 <b>Admins:</b> {admins_list}",
+            parse_mode=ParseMode.HTML
+        )
+    
+    elif action == "status":
+        uptime = time.time() - BOT_STATS["start_time"]
+        uptime_str = f"{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m"
+        msg = (
+            "📊 <b>Bot Status</b>\n"
+            f"⏱️ Uptime: {uptime_str}\n"
+            f"📨 Total Messages: {BOT_STATS['total_messages']}\n"
+            f"👥 Total Users: {len(CONVERSATION_HISTORY)}\n"
+            f"🔑 Admins: {len(ADMIN_USERS)}\n"
+            f"🚫 Blacklist: {len(BLACKLIST)}\n"
+            f"⚪ Whitelist: {len(WHITELIST)} {'(active)' if WHITELIST else '(inactive)'}"
+        )
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+    
+    elif action == "users":
+        await update.message.reply_text(
+            f"👥 <b>Total Users:</b> {len(CONVERSATION_HISTORY)}",
+            parse_mode=ParseMode.HTML
+        )
+    
+    elif action == "reset_all":
+        CONVERSATION_HISTORY.clear()
+        await update.message.reply_text(
+            "🧹 <b>All conversations reset!</b>",
+            parse_mode=ParseMode.HTML
+        )
+    
+    elif action == "broadcast" and len(args) > 1:
+        broadcast_msg = " ".join(args[1:])
+        count = 0
+        for user in CONVERSATION_HISTORY.keys():
+            try:
+                await context.bot.send_message(
+                    chat_id=user,
+                    text=f"📢 <b>Broadcast:</b>\n{broadcast_msg}",
+                    parse_mode=ParseMode.HTML
+                )
+                count += 1
+            except Exception as e:
+                logger.warning(f"Failed to send broadcast to {user}: {e}")
+        
+        await update.message.reply_text(
+            f"✅ Broadcast sent to {count} users.",
+            parse_mode=ParseMode.HTML
+        )
+
+
+async def blacklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Blacklist management."""
+    user_id = update.message.from_user.id
+    
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ You don't have admin permissions.")
+        return
+    
+    args = context.args
+    if not args:
+        blacklist_str = ", ".join([str(id) for id in sorted(BLACKLIST)])
+        await update.message.reply_text(
+            f"🚫 <b>Blacklist:</b> {blacklist_str or 'Empty'}",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    action = args[0].lower()
+    
+    if action == "add" and len(args) > 1:
+        try:
+            target_id = int(args[1])
+            BLACKLIST.add(target_id)
+            save_admin_users()
+            await update.message.reply_text(
+                f"✅ User {target_id} has been blacklisted.",
+                parse_mode=ParseMode.HTML
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID.")
+    
+    elif action == "remove" and len(args) > 1:
+        try:
+            target_id = int(args[1])
+            BLACKLIST.discard(target_id)
+            save_admin_users()
+            await update.message.reply_text(
+                f"✅ User {target_id} has been removed from blacklist.",
+                parse_mode=ParseMode.HTML
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID.")
+    
+    elif action == "list":
+        blacklist_str = ", ".join([str(id) for id in sorted(BLACKLIST)])
+        await update.message.reply_text(
+            f"🚫 <b>Blacklist:</b>\n{blacklist_str or 'Empty'}",
+            parse_mode=ParseMode.HTML
+        )
+
+
+async def whitelist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Whitelist management."""
+    user_id = update.message.from_user.id
+    
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ You don't have admin permissions.")
+        return
+    
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /whitelist <on|off|add|remove|list>")
+        return
+    
+    action = args[0].lower()
+    
+    if action == "on":
+        if WHITELIST:
+            await update.message.reply_text("⚪ Whitelist is already enabled.")
+        else:
+            WHITELIST.add(user_id)  # Add self to whitelist
+            save_admin_users()
+            await update.message.reply_text(
+                "✅ Whitelist mode <b>ENABLED</b>. Only whitelisted users can access the bot.",
+                parse_mode=ParseMode.HTML
+            )
+    
+    elif action == "off":
+        WHITELIST.clear()
+        save_admin_users()
+        await update.message.reply_text(
+            "✅ Whitelist mode <b>DISABLED</b>. All users can access the bot.",
+            parse_mode=ParseMode.HTML
+        )
+    
+    elif action == "add" and len(args) > 1:
+        try:
+            target_id = int(args[1])
+            WHITELIST.add(target_id)
+            save_admin_users()
+            await update.message.reply_text(
+                f"✅ User {target_id} added to whitelist.",
+                parse_mode=ParseMode.HTML
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID.")
+    
+    elif action == "remove" and len(args) > 1:
+        try:
+            target_id = int(args[1])
+            WHITELIST.discard(target_id)
+            save_admin_users()
+            await update.message.reply_text(
+                f"✅ User {target_id} removed from whitelist.",
+                parse_mode=ParseMode.HTML
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID.")
+    
+    elif action == "list":
+        whitelist_str = ", ".join([str(id) for id in sorted(WHITELIST)])
+        status = "<b>ON</b>" if WHITELIST else "<b>OFF</b>"
+        await update.message.reply_text(
+            f"⚪ <b>Whitelist Status:</b> {status}\n\nUsers: {whitelist_str or 'None'}",
+            parse_mode=ParseMode.HTML
+        )
+
+
+# ======================================================================
+# === /setlang command =================================================
+# ======================================================================
+
+async def setlang_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    valid_langs = {"en", "id", "hi", "ur"}
+
+    if not args:
+        msg = (
+            "🌐 <b>Set Language</b>\n\n"
+            f"Usage: /setlang <code>{'|'.join(sorted(valid_langs))}</code>\n\n"
+            "Languages:\n"
+            "  🇺🇸 <code>en</code> — English\n"
+            "  🇮🇩 <code>id</code> — Indonesian\n"
+            "  🇮🇳 <code>hi</code> — Hindi\n"
+            "  🇵🇰 <code>ur</code> — Urdu"
+        )
+        return await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+
+    user_id = str(update.message.from_user.id)
+    code = args[0].lower()
+
+    if code not in valid_langs:
+        return await update.message.reply_text(
+            f"❌ Unknown language: <code>{code}</code>\n"
+            f"Valid: <code>{'|'.join(sorted(valid_langs))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+    USER_LANGS[user_id] = code
+    save_user_langs()
+    await update.message.reply_text(
+        f"✅ Language set to: <code>{code.upper()}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ======================================================================
 # === Message Handler ==================================================
 # ======================================================================
 
@@ -378,8 +742,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.from_user:
         return
 
-    bot_username = context.bot_data.get("username", "")
     user_id = update.message.from_user.id
+    
+    # Check blacklist first
+    if is_blacklisted(user_id):
+        await update.message.reply_text("🚫 You are blacklisted and cannot use this bot.")
+        return
+    
+    # Check whitelist if enabled
+    if not is_whitelisted(user_id) and not is_admin(user_id):
+        await update.message.reply_text("⚪ This bot is in whitelist mode. You don't have access.")
+        return
+    
+    bot_username = context.bot_data.get("username", "")
     user_msg = (update.message.text or "").strip()
     chat_type = update.message.chat.type
 
@@ -403,6 +778,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     LAST_MESSAGE_TIME[user_id] = now
+    BOT_STATS["total_messages"] += 1
 
     # === Must mention bot in group ===
     if chat_type in ("group", "supergroup"):
@@ -481,44 +857,6 @@ async def send_long_message(update: Update, text: str, chunk_size: int = 4000):
 
 
 # ======================================================================
-# === /setlang command =================================================
-# ======================================================================
-
-async def setlang_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    valid_langs = {"en", "id", "hi", "ur"}
-
-    if not args:
-        msg = (
-            "🌐 <b>Set Language</b>\n\n"
-            f"Usage: /setlang <code>{'|'.join(sorted(valid_langs))}</code>\n\n"
-            "Languages:\n"
-            "  🇺🇸 <code>en</code> — English\n"
-            "  🇮🇩 <code>id</code> — Indonesian\n"
-            "  🇮🇳 <code>hi</code> — Hindi\n"
-            "  🇵🇰 <code>ur</code> — Urdu"
-        )
-        return await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
-
-    user_id = str(update.message.from_user.id)
-    code = args[0].lower()
-
-    if code not in valid_langs:
-        return await update.message.reply_text(
-            f"❌ Unknown language: <code>{code}</code>\n"
-            f"Valid: <code>{'|'.join(sorted(valid_langs))}</code>",
-            parse_mode=ParseMode.HTML,
-        )
-
-    USER_LANGS[user_id] = code
-    save_user_langs()
-    await update.message.reply_text(
-        f"✅ Language set to: <code>{code.upper()}</code>",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ======================================================================
 # === Error Handler ====================================================
 # ======================================================================
 
@@ -548,6 +886,9 @@ async def post_init(application):
         BotCommand("reset", "🧹 Clear chat history"),
         BotCommand("stats", "📊 Your usage stats"),
         BotCommand("ping", "🏓 Check latency"),
+        BotCommand("admin", "👑 Admin panel"),
+        BotCommand("blacklist", "🚫 Blacklist users"),
+        BotCommand("whitelist", "⚪ Whitelist users"),
     ]
     await application.bot.set_my_commands(commands)
     logger.info("✅ Bot commands registered")
@@ -565,6 +906,9 @@ def run_bot():
     if not MODEL_CONFIG["key"]:
         logger.error("OPENROUTER_KEY is not set!")
         return
+    
+    # Load admin users on startup
+    load_admin_users()
 
     app = (
         ApplicationBuilder()
@@ -580,6 +924,9 @@ def run_bot():
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
+    app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CommandHandler("blacklist", blacklist_cmd))
+    app.add_handler(CommandHandler("whitelist", whitelist_cmd))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(language_callback, pattern=r"^lang_"))
@@ -592,6 +939,7 @@ def run_bot():
     app.add_error_handler(error_handler)
 
     logger.info("🚀 WormGPT Bot Running... (Model: %s)", MODEL_CONFIG["name"])
+    logger.info("👑 Admin System Initialized")
 
     # Python 3.14+ removed auto-creation of event loops
     try:

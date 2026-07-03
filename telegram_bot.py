@@ -30,13 +30,13 @@ USER_LANG_FILE = "user_langs.json"
 MODEL_CONFIG = {
     "name": os.getenv("MODEL_NAME", "deepseek/deepseek-chat"),
     "base_url": os.getenv("API_BASE_URL", "https://openrouter.ai/api/v1"),
-    "key": os.getenv("OPENROUTER_KEY"),
+    "key": os.getenv("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"),
 }
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = os.getenv("8267095618:AAFKUedUQkPvz99oPY64f1H7DmWZUNMV9_E")
 
 # === Channels required to join ===
-REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "@AbdulBotzOfficial")
+REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "@rex_developers")
 
 # === Anti-Flood ===
 LAST_MESSAGE_TIME: dict[int, float] = {}
@@ -378,7 +378,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.from_user:
         return
 
-    bot_username = context.bot_data.get("username", "")
+    bot_username = context.bot_data.get("@rikagpt_bot", "")
     user_id = update.message.from_user.id
     user_msg = (update.message.text or "").strip()
     chat_type = update.message.chat.type
@@ -568,7 +568,7 @@ def run_bot():
 
     app = (
         ApplicationBuilder()
-        .token(TELEGRAM_TOKEN)
+        .token(8267095618:AAFKUedUQkPvz99oPY64f1H7DmWZUNMV9_E)
         .post_init(post_init)
         .build()
     )
